@@ -14,10 +14,10 @@
             if (!overlay) {
                 overlay = document.createElement('div');
                 overlay.id = overlayId;
-                overlay.style.cssText = 'position:fixed;bottom:100px;left:24px;background:#FF4500;color:#fff;z-index:9999999;font-family:monospace;max-width:500px;font-size:13px;border:3px solid #FFA500;border-radius:10px;box-shadow: 0 0 20px #FF4500;display:flex;flex-direction:column;';
+                overlay.style.cssText = 'position:fixed;bottom:100px;left:24px;background:#FF4500;color:#fff;z-index:9999999;font-family:monospace;max-width:500px;font-size:13px;border:3px solid #FFA500;border-radius:10px;box-shadow: none;display:flex;flex-direction:column;';
                 
                 const header = document.createElement('div');
-                header.style.cssText = 'background:#CC3700;padding:8px 12px;cursor:pointer;border-top-left-radius:7px;border-top-right-radius:7px;display:flex;justify-content:space-between;align-items:center;border-bottom:2px solid #FFA500;font-weight:900;text-shadow:0 0 5px rgba(255,255,255,0.5);';
+                header.style.cssText = 'background:#CC3700;padding:8px 12px;cursor:pointer;border-top-left-radius:7px;border-top-right-radius:7px;display:flex;justify-content:space-between;align-items:center;border-bottom:2px solid #FFA500;font-weight:900;text-shadow:none;';
                 header.innerHTML = '<span>Syft Debug Log</span><span id="syft-debug-toggle">▼</span>';
                 
                 const content = document.createElement('div');
@@ -47,4 +47,7 @@
             }
         }
     };
+
+    // Auto-init visible debug log
+    window.SyftDebug.push('System', 'Debug Console Initialized');
 })();
