@@ -1,0 +1,83 @@
+# PRD: Syft V2 (The Dynamic Enrichment Engine)
+
+## 1. Project Vision
+Syft will evolve from a literal keyword search tool into a high-performance music discovery engine. By combining **BM25 text ranking**, **Last.fm crowd-sourced tagging**, and **Spotify Audio Features**, Syft will resolve complex "vibe" queries without requiring any manual data entry from the user.
+
+---
+
+## 2. The Three-Pillar Index Architecture
+To achieve sub-200ms latency on 10,000+ tracks, the search index will be split into three optimized layers:
+
+| Pillar | Data Source | Type | Purpose |
+| :--- | :--- | :--- | :--- |
+| **Identity** | Spotify Metadata | Text | Primary matching for Track Name, Artist, and Album. |
+| **Context** | **Last.fm API** | Text (Tags) | Captures "vibes" like *chill, 90s, bhangra, moody, lowkey*. |
+| **Sonics** | **Spotify Audio API** | Numerical | Quantitative measures like *Energy, Valence, Tempo*. |
+
+---
+
+## 3. Modular Implementation Roadmap
+
+### Phase 1: Performance & Indexing (The Foundation)
+*Goal: Ensure Spotify stays buttery smooth while we crunch thousands of songs.*
+
+* **1.1: Non-Blocking Background Indexing**
+    * Rewrite the library loading loop to yield the main thread using a `sleep(50)` utility every 5–10 playlists.
+    * Implement a persistent "Indexing..." progress bar in the Global UI.
+* **1.2: Postings List Construction**
+    * Transition from $O(n)$ array scanning to a proper **Inverted Index** (Postings List).
+    * Map every token (from Title, Artist, and Last.fm tags) to a `Set` of Track URIs for instant lookup.
+    
+
+
+### Phase 2: Metadata Enrichment (The Data Fetch)
+*Goal: Automatically "tag" every song in the user's library.*
+
+* **2.1: Spotify Audio Feature Batching**
+    * Fetch `energy`, `valence`, and `danceability` for all library tracks in batches of 100.
+    * **Source**: `GET https://api.spotify.com/v1/audio-features?ids=...?ids={batch}`.
+    * Utilize batch-fetching methods defined in the Spotify for Developers guides.
+* **2.2: Last.fm Tag Enrichment**
+    * For every unique track/artist combo, fetch top user tags via `track.getTopTags`.
+    * Logic: Clean and tokenize the top 5–10 tags (e.g., "Late Night" becomes `late`, `night`) and inject them into the Inverted Index.
+
+
+
+### Phase 3: The Hybrid Search Engine
+*Goal: Score tracks based on how well they match both the text and the "feel" of a query.*
+
+* **3.1: Multi-Field BM25 Scoring**
+    * Execute the search against a combined text field: `Name + Artist + LastFmTags`.
+    * Use standardized audio analysis to provide a measurement of "vibe".
+* **3.2: Dynamic Audio Boosting**
+    * Implement "Smart Filters" that detect intent. If a query contains vibe-heavy words (e.g., "sad", "party", "fast"), apply a multiplier based on Spotify Audio Features.
+    * *Example*: If the query is "sad", boost tracks with a **Valence** score $< 0.3$.
+* **3.3: Result Merging**
+    * Calculate the final score using a weighted average:
+    $$Total\ Score = (W_{text} \cdot Score_{BM25}) + (W_{vibe} \cdot Score_{Audio})$$
+
+### Phase 4: Consumption (The "Play All" MVP)
+*Goal: Turn search results into an instant listening session.*
+
+* **4.1: The Result Queue**
+    * Add a "Play All Matches" button to the results header.
+    * When clicked, the extension will:
+        1.  Collect all URIs currently in the results list (top 50–100).
+        2.  Clear the user's current Spotify queue.
+        3.  Trigger `Spicetify.Player.playUri()` for the first result.
+        4.  Sequence the remaining URIs into the queue.
+
+---
+
+## 4. Performance Targets
+* **Initial Indexing**: < 15 seconds for 5,000 tracks (Backgrounded).
+* **Search Latency**: < 100ms for local library queries.
+* **Memory Footprint**: < 30MB total overhead for the Inverted Index and Audio Metadata.
+
+---
+
+## 5. Technical Risks & Mitigations
+* **API Rate Limits**: Last.fm and Spotify have strict limits.
+    * **Mitigation**: Cache all enriched metadata in `IndexedDB`. Once a song is "Syfted," we never fetch its tags or features again unless the cache is cleared.
+* **Network Latency**: Fetching tags for 10k songs can take time.
+    * **Mitigation**: Prioritize the "Current Playlist" first, then lazily index the "Full Library" in the background.

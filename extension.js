@@ -10,6 +10,66 @@
 
     const BM25_K1 = 1.5;
     const BM25_B = 0.75;
+    const LASTFM_API_KEY = 'c6d8d7e6b3f61e406ae0c21792b983df';
+
+    const LANG_MAP = {
+        'hindi': ['hindi', 'bollywood', 'desi', 'filmi', 'indian', 'india'],
+        'punjabi': ['punjabi', 'bhangra', 'punj'],
+        'arabic': ['arabic', 'arab', 'middle eastern'],
+        'spanish': ['spanish', 'latin', 'reggaeton', 'urbano'],
+        'english': ['english', 'pop', 'american', 'british', 'uk', 'usa']
+    };
+
+    function extractLanguages(tags) {
+        let langs = new Set();
+        let rem = [];
+        tags.forEach(t => {
+            let matched = false;
+            for (const [lang, keywords] of Object.entries(LANG_MAP)) {
+                if (keywords.some(k => t.includes(k))) {
+                    langs.add(lang);
+                    matched = true;
+                }
+            }
+            if (!matched) rem.push(t);
+        });
+        return { languages: Array.from(langs), tags: rem };
+    }
+
+    // IndexedDB Cache Wrapper
+    const SyftCache = {
+        db: null,
+        init: function () {
+            return new Promise((resolve, reject) => {
+                const req = indexedDB.open('SyftCacheDB', 4);
+                req.onupgradeneeded = e => {
+                    if (e.oldVersion > 0 && e.target.result.objectStoreNames.contains('tags')) {
+                        e.target.result.deleteObjectStore('tags');
+                    }
+                    e.target.result.createObjectStore('tags');
+                };
+                req.onsuccess = e => { this.db = e.target.result; resolve(); };
+                req.onerror = e => reject(e);
+            });
+        },
+        get: function (key) {
+            return new Promise(resolve => {
+                if (!this.db) return resolve(null);
+                const tx = this.db.transaction('tags', 'readonly');
+                const req = tx.objectStore('tags').get(key);
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => resolve(null);
+            });
+        },
+        set: function (key, val) {
+            if (!this.db) return;
+            const tx = this.db.transaction('tags', 'readwrite');
+            tx.objectStore('tags').put(val, key);
+        }
+    };
+
+    let enrichmentQueue = [];
+    let isEnriching = false;
 
     let currentPlaylist = null;
     let playlistTracks = [];
@@ -30,13 +90,14 @@
     // Initialize
     function init() {
         console.log('[Syft] Init...');
+        SyftCache.init().catch(e => console.error('[Syft] Cache Init Error', e));
         createStatusEl();
         updateStatus('Starting up...');
         injectStyles();
-        
+
         // Start polling for page changes (playlist)
         setTimeout(checkPage, 2000);
-        
+
         // Attempt to inject global button next to search bar
         injectGlobalButton();
 
@@ -46,6 +107,9 @@
 
     function log(msg) {
         console.log('[Syft]', msg);
+        if (window.SyftDebug && window.SyftDebug.push) {
+            window.SyftDebug.push('Log', msg);
+        }
     }
 
     function createStatusEl() {
@@ -109,13 +173,13 @@
             -webkit-app-region: no-drag;
             pointer-events: auto;
         `;
-        
+
         globalBtnEl.onmouseover = () => { globalBtnEl.style.transform = 'scale(1.05)'; };
         globalBtnEl.onmouseout = () => { globalBtnEl.style.transform = 'scale(1)'; };
 
         globalBtnEl.onclick = function () {
             if (!globalSyftPanel) createGlobalPanel();
-            globalSyftPanel.style.display = globalSyftPanel.style.display === 'block' ? 'none' : 'block';
+            globalSyftPanel.style.display = globalSyftPanel.style.display === 'flex' ? 'none' : 'flex';
         };
 
         // Append next to the search box (as a sibling)
@@ -130,6 +194,7 @@
         globalSyftPanel = document.createElement('div');
         globalSyftPanel.style.cssText = `
             display: none;
+            flex-direction: column;
             position: fixed;
             top: 70px;
             left: 50%;
@@ -148,10 +213,10 @@
                 <span style="font-weight:bold;font-size:15px;color:black;background:#FFFF00;padding:4px 8px;border-radius:4px;">Library Search</span>
                 <button id="syft-global-x" style="background:none;border:none;color:#fff;font-size:24px;cursor:pointer;">×</button>
             </div>
-            <div style="padding:10px;background:#121212;">
+            <div style="padding:10px;background:#121212;flex-shrink:0;">
                 <input type="text" id="syft-global-input" placeholder="Search your entire library..." style="width:100%;padding:10px;background:#282828;border:2px solid #FFFF00;border-radius:6px;color:#fff;font-size:14px;box-sizing:border-box;">
             </div>
-            <div id="syft-global-results" style="max-height:calc(60vh - 90px);overflow-y:auto;"></div>
+            <div id="syft-global-results" style="flex:1;overflow-y:auto;padding-bottom:12px;"></div>
         `;
 
         document.body.appendChild(globalSyftPanel);
@@ -172,15 +237,19 @@
     async function loadLibrary() {
         updateStatus('Indexing library...');
         if (globalResultsContainer) showState(globalResultsContainer, '<div class="spin"></div>Indexing library...');
-        
+
         try {
             libraryTracks = await fetchLibraryTracks();
+            libraryTracks.forEach(t => t.tags = []); // init
             librarySearchIndex = buildIndex(libraryTracks);
             log('Indexed ' + libraryTracks.length + ' library tracks');
             updateStatus(`Library Ready (${libraryTracks.length} tracks)`);
             if (globalResultsContainer) {
                 showState(globalResultsContainer, libraryTracks.length + ' library songs indexed. Type to search.');
             }
+            // Temporarily disabled library enrichment to drastically reduce startup load
+            // enrichmentQueue.push(...libraryTracks);
+            // startEnrichment();
         } catch (e) {
             updateStatus('Library Error: ' + e.message);
             log('Library Error: ' + e.message);
@@ -191,11 +260,11 @@
     async function fetchLibraryTracks() {
         let tracks = [];
         let seenUris = new Set();
-        
+
         try {
             log('Fetching playlists to aggregate library');
             let playlistIds = [];
-            
+
             // Try Spicetify RootlistAPI if available
             if (Spicetify?.Platform?.RootlistAPI?.getContents) {
                 try {
@@ -215,7 +284,7 @@
                     }
                 } catch (e) { pushDebug('RootlistAPI_Err', e.message); }
             }
-            
+
             if (playlistIds.length === 0) {
                 try {
                     let url = 'https://api.spotify.com/v1/me/playlists?limit=50';
@@ -227,11 +296,11 @@
                         }
                         url = d.next;
                     }
-                } catch(e) { pushDebug('PlaylistWebAPI_Err', e.message); }
+                } catch (e) { pushDebug('PlaylistWebAPI_Err', e.message); }
             }
 
             log('Found ' + playlistIds.length + ' playlists. Aggregating tracks...');
-            
+
             for (let i = 0; i < playlistIds.length; i++) {
                 if (i % 5 === 0) {
                     updateStatus(`Indexing library... (${i}/${playlistIds.length} playlists)`);
@@ -244,12 +313,12 @@
                     }
                 }
             }
-            
+
             if (tracks.length > 0) return tracks;
         } catch (e) {
             pushDebug('LibraryFetch_Err', e.message);
         }
-        
+
         return tracks;
     }
 
@@ -326,7 +395,7 @@
         };
         btnEl.onclick = function () {
             if (!syftPanel) createPanel();
-            syftPanel.style.display = syftPanel.style.display === 'block' ? 'none' : 'block';
+            syftPanel.style.display = syftPanel.style.display === 'flex' ? 'none' : 'flex';
         };
         document.body.appendChild(btnEl);
         log('Playlist Button created');
@@ -336,6 +405,7 @@
         syftPanel = document.createElement('div');
         syftPanel.style.cssText = `
             display: none;
+            flex-direction: column;
             position: fixed;
             top: 115px;
             right: 24px;
@@ -353,10 +423,10 @@
                 <span style="color:#FF6B00;font-weight:bold;font-size:15px;">Syft Search</span>
                 <button id="syft-x" style="background:none;border:none;color:#fff;font-size:24px;cursor:pointer;">×</button>
             </div>
-            <div style="padding:10px;background:#121212;">
+            <div style="padding:10px;background:#121212;flex-shrink:0;">
                 <input type="text" id="syft-input" placeholder="Search playlist..." style="width:100%;padding:10px;background:#282828;border:2px solid #FF6B00;border-radius:6px;color:#fff;font-size:14px;box-sizing:border-box;">
             </div>
-            <div id="syft-results" style="max-height:calc(60vh - 90px);overflow-y:auto;"></div>
+            <div id="syft-results" style="flex:1;overflow-y:auto;padding-bottom:12px;"></div>
         `;
 
         document.body.appendChild(syftPanel);
@@ -382,6 +452,10 @@
             .state{padding:24px;text-align:center;color:#666}
             .spin{width:20px;height:20px;border:2px solid #444;border-top:2px solid #FF6B00;border-radius:50%;animation:sspin .8s linear infinite;margin:0 auto 8px}
             @keyframes sspin{to{transform:rotate(360deg)}}
+            .tags-cont{display:flex;gap:6px;overflow-x:auto;margin-top:4px;scrollbar-width:none;}
+            .tags-cont::-webkit-scrollbar{display:none;}
+            .tag-pill{background:#ccc;color:#000;font-size:10px;padding:2px 8px;border-radius:12px;font-weight:700;white-space:nowrap;}
+            .tag-lang{background:#1DB954;color:#fff;}
         `;
         document.head.appendChild(css);
     }
@@ -391,10 +465,14 @@
         updateStatus('Indexing tracks...');
         try {
             playlistTracks = await fetchTracks(id);
+            playlistTracks.forEach(t => t.tags = []); // init
             searchIndex = buildIndex(playlistTracks);
             log('Indexed ' + playlistTracks.length + ' tracks');
             updateStatus(`Ready (${playlistTracks.length} tracks)`);
             showState(resultsContainer, playlistTracks.length + ' songs indexed. Type to search.');
+
+            enrichmentQueue.push(...playlistTracks);
+            startEnrichment();
         } catch (e) {
             updateStatus('Error: ' + e.message);
             log('Error: ' + e.message);
@@ -403,8 +481,7 @@
     }
 
     function pushDebug(tag, dump) {
-        log(tag + ' -> ' + dump);
-
+        console.log('[Syft] ' + tag, dump);
         if (window.SyftDebug && window.SyftDebug.push) {
             window.SyftDebug.push(tag, dump);
         }
@@ -426,6 +503,7 @@
                             id: target.uri ? target.uri.split(':').pop() : (target.id || ''),
                             name: target.name || '?',
                             artist: target.artists ? target.artists.map(a => a.name).join(', ') : '?',
+                            artistId: target.artists && target.artists[0] && target.artists[0].uri ? target.artists[0].uri.split(':').pop() : '',
                             uri: target.uri || ''
                         };
                     }).filter(t => t.uri && t.uri.includes('track'));
@@ -445,6 +523,7 @@
                     id: t.id,
                     name: t.name,
                     artist: t.artists ? t.artists.map(a => a.name).join(', ') : '',
+                    artistId: t.artists && t.artists[0] ? t.artists[0].id : '',
                     uri: t.uri
                 })));
                 url = d.next;
@@ -464,6 +543,7 @@
                     id: t.id,
                     name: t.name,
                     artist: t.artists ? t.artists.map(a => a.name).join(', ') : '',
+                    artistId: t.artists && t.artists[0] ? t.artists[0].id : '',
                     uri: t.uri
                 })));
                 url = d.next;
@@ -478,7 +558,7 @@
         if (!tracks.length) return null;
         const df = {};
         tracks.forEach(t => {
-            const toks = `${t.name} ${t.artist}`.toLowerCase().split(/\s+/);
+            const toks = `${t.name} ${t.artist} ${(t.tags || []).join(' ')} ${(t.languages || []).join(' ')}`.toLowerCase().split(/\s+/);
             new Set(toks).forEach(x => df[x] = (df[x] || 0) + 1);
         });
         const idf = {};
@@ -495,29 +575,58 @@
         const tokens = query.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(x => x.length > 1);
         if (!tokens.length) { showState(container, tracks.length + ' songs. Type to search.'); return; }
 
-        const results = tracks.map(t => ({ t, s: score(t, tokens, index) })).sort((a, b) => b.s - a.s).filter(r => r.s > 0).slice(0, 25);
+        const rawQuery = query.toLowerCase().trim();
+
+        const results = tracks.map(t => ({ t, s: score(t, rawQuery, tokens, index) })).sort((a, b) => b.s - a.s).filter(r => r.s > 0).slice(0, 25);
         if (!results.length) showState(container, 'No results for "' + query + '"');
         else showResults(container, results.map(r => r.t));
     }
 
-    function score(track, qtokens, index) {
+    function score(track, rawQuery, qtokens, index) {
         if (!index || !qtokens.length) return 0;
-        const toks = `${track.name} ${track.artist}`.toLowerCase().split(/\s+/);
+        
+        const trackNameLower = track.name.toLowerCase();
+        const artistLower = track.artist.toLowerCase();
+        const languages = track.languages || [];
+        const tags = track.tags || [];
+        
         let sc = 0;
+        
+        // 1. BM25 Base Scoring
+        const toks = `${trackNameLower} ${artistLower} ${tags.join(' ')} ${languages.join(' ')}`.split(/\s+/);
         for (const q of qtokens) {
             const tf = toks.filter(t => t.includes(q) || q.includes(t)).length;
             sc += (index.idf[q] || 0) * (tf * (BM25_K1 + 1)) / (tf + BM25_K1);
         }
+        
+        // 2. Exact Match Multipliers & Boosts
+        if (trackNameLower === rawQuery) sc += 1000;
+        else if (trackNameLower.includes(rawQuery)) sc += 500;
+        
+        if (artistLower === rawQuery || artistLower.includes(rawQuery)) sc += 200;
+
+        if (languages.includes(rawQuery)) sc += 150;
+        else if (languages.some(l => l.includes(rawQuery) || rawQuery.includes(l))) sc += 100;
+
+        if (tags.includes(rawQuery)) sc += 50;
+        else if (tags.some(t => t.includes(rawQuery))) sc += 20;
+
         return sc;
     }
 
-    function showState(container, html) { 
-        if (container) container.innerHTML = '<div class="state">' + html + '</div>'; 
+    function showState(container, html) {
+        if (container) container.innerHTML = '<div class="state">' + html + '</div>';
     }
 
     function showResults(container, tracks) {
         if (!container) return;
-        container.innerHTML = tracks.map(t => '<div class="item" data-uri="' + t.uri + '"><div class="art"></div><div class="info"><div class="name">' + esc(t.name) + '</div><div class="artist">' + esc(t.artist) + '</div></div></div>').join('');
+        container.innerHTML = tracks.map(t => {
+            let pills = [];
+            if (t.languages && t.languages.length > 0) pills.push(...t.languages.map(l => '<span class="tag-pill tag-lang">' + esc(l) + '</span>'));
+            if (t.tags && t.tags.length > 0) pills.push(...t.tags.map(tag => '<span class="tag-pill">' + esc(tag) + '</span>'));
+            const tagsHtml = pills.length > 0 ? '<div class="tags-cont">' + pills.join('') + '</div>' : '';
+            return '<div class="item" data-uri="' + t.uri + '"><div class="art"></div><div class="info"><div class="name">' + esc(t.name) + '</div><div class="artist">' + esc(t.artist) + '</div>' + tagsHtml + '</div></div>';
+        }).join('');
         container.querySelectorAll('.item').forEach(item => {
             item.onclick = () => { if (item.dataset.uri && Spicetify?.Player) Spicetify.Player.playUri(item.dataset.uri); };
         });
@@ -525,6 +634,109 @@
 
     function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
     function debounce(fn, w) { let to; return (...a) => { clearTimeout(to); to = setTimeout(() => fn(...a), w); }; }
+
+    async function fetchLastFmTags(artist, trackName) {
+        if (!artist || !trackName) return [];
+        let cleanArtist = artist.split(',')[0].trim();
+        let cleanTrack = trackName.replace(/\s*[([].*?[)\]]\s*/g, '').split('-')[0].trim();
+
+        const cacheKey = `${cleanArtist}-${cleanTrack}`.toLowerCase();
+        const cached = await SyftCache.get(cacheKey);
+        if (cached !== undefined) return cached;
+
+        let tags = [];
+        try {
+            const url = `https://ws.audioscrobbler.com/2.0/?method=track.gettoptags&artist=${encodeURIComponent(cleanArtist)}&track=${encodeURIComponent(cleanTrack)}&api_key=${LASTFM_API_KEY}&format=json`;
+            const r = await fetch(url);
+            const d = await r.json();
+            if (d && d.toptags && d.toptags.tag && d.toptags.tag.length > 0) {
+                tags = d.toptags.tag.filter(x => parseInt(x.count) > 2).slice(0, 5).map(x => x.name.toLowerCase());
+            }
+
+            if (tags.length === 0) {
+                const urlArtist = `https://ws.audioscrobbler.com/2.0/?method=artist.gettoptags&artist=${encodeURIComponent(cleanArtist)}&api_key=${LASTFM_API_KEY}&format=json`;
+                const rArtist = await fetch(urlArtist);
+                const dArtist = await rArtist.json();
+                if (dArtist && dArtist.toptags && dArtist.toptags.tag && dArtist.toptags.tag.length > 0) {
+                    tags = dArtist.toptags.tag.filter(x => parseInt(x.count) > 5).slice(0, 5).map(x => x.name.toLowerCase());
+                }
+            }
+
+            SyftCache.set(cacheKey, tags);
+            return tags;
+        } catch (e) {
+            SyftCache.set(cacheKey, []);
+            return [];
+        }
+    }
+
+    async function startEnrichment() {
+        if (isEnriching) return;
+        isEnriching = true;
+        log('Enrichment started, queue size: ' + enrichmentQueue.length);
+        let processed = 0;
+        let updated = false;
+        let taggedCount = 0;
+        while (enrichmentQueue.length > 0) {
+            const track = enrichmentQueue.shift();
+            if ((!track.tags || track.tags.length === 0) && (!track.languages || track.languages.length === 0)) {
+                let tags = await fetchLastFmTags(track.artist, track.name);
+
+                if (Array.isArray(tags)) {
+                    let extracted = extractLanguages(tags);
+
+                    if (extracted.languages.length === 0 && track.artistId) {
+                        try {
+                            const cachedArt = await SyftCache.get('artgen-' + track.artistId);
+                            let sptags = [];
+                            if (cachedArt) {
+                                sptags = cachedArt;
+                            } else {
+                                const ad = await Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/artists/${track.artistId}`);
+                                if (ad && ad.genres) {
+                                    sptags = ad.genres;
+                                    SyftCache.set('artgen-' + track.artistId, sptags);
+                                }
+                            }
+                            if (sptags.length > 0) {
+                                const ext2 = extractLanguages(sptags);
+                                extracted.languages = ext2.languages;
+                            }
+                        } catch (e) { }
+                    }
+
+                    if (extracted.languages.length > 0 || extracted.tags.length > 0) {
+                        track.languages = extracted.languages;
+                        track.tags = extracted.tags;
+                        updated = true;
+                        taggedCount++;
+                        pushDebug('Enriched', `${track.name}: [${track.languages.join(',')}] [${track.tags.join(',')}]`);
+                    } else {
+                        track.tags = [];
+                        track.languages = [];
+                    }
+                }
+            }
+            processed++;
+            if (processed % 20 === 0) {
+                log('Enrichment progress: ' + processed + ' processed, ' + taggedCount + ' tagged, ' + enrichmentQueue.length + ' remaining');
+            }
+            // Slightly delay next request to avoid rate limits
+            await new Promise(r => setTimeout(r, 250));
+            // Rebuild indexes periodically
+            if (updated && processed % 30 === 0) {
+                if (searchIndex) searchIndex = buildIndex(playlistTracks);
+                if (librarySearchIndex) librarySearchIndex = buildIndex(libraryTracks);
+                updated = false;
+            }
+        }
+        if (updated) {
+            if (searchIndex) searchIndex = buildIndex(playlistTracks);
+            if (librarySearchIndex) librarySearchIndex = buildIndex(libraryTracks);
+        }
+        log('Enrichment complete: ' + processed + ' processed, ' + taggedCount + ' tagged');
+        isEnriching = false;
+    }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
     else init();
